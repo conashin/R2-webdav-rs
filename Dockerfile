@@ -20,11 +20,13 @@ RUN mkdir -p src \
 
 # Now build the real sources.
 COPY src ./src
-RUN cargo build --release --locked \
+RUN rm -f target/release/r2-webdav target/release/deps/r2_webdav* \
+    && touch src/main.rs \
+    && cargo build --release --locked \
     && strip target/release/r2-webdav
 
 # ---- runtime ----------------------------------------------------------------
-FROM alpine:3.20
+FROM alpine:3
 
 # ca-certificates: rustls loads the system trust store to verify R2's TLS cert.
 RUN apk add --no-cache ca-certificates \
