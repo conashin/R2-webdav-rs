@@ -62,6 +62,29 @@ export RUST_LOG=info
 > Basic auth sends credentials in every request. Run behind TLS (a reverse proxy such as
 > Caddy/nginx, or a Cloudflare Tunnel) for anything beyond localhost.
 
+## Docker
+
+A small static (musl) Alpine image is published to GitHub Container Registry by the
+`Docker Image` workflow — on every GitHub **release**, and on demand via
+**workflow_dispatch**.
+
+```sh
+docker run --rm -p 4918:4918 \
+  -e R2_ACCOUNT_ID=xxxxxxxxxxxxxxxx \
+  -e R2_ACCESS_KEY_ID=... \
+  -e R2_SECRET_ACCESS_KEY=... \
+  -e R2_BUCKET=my-bucket \
+  -e WEBDAV_USERNAME=alice \
+  -e WEBDAV_PASSWORD=s3cret \
+  ghcr.io/conashin/r2-webdav-rs:latest
+```
+
+Build it locally:
+
+```sh
+docker build -t r2-webdav .
+```
+
 ## Usage
 
 ### curl
