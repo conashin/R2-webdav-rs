@@ -41,7 +41,10 @@ impl R2FileSystem {
     /// failing that, the presence of any object under the prefix.
     async fn dir_metadata(&self, key: &str) -> FsResult<Box<dyn DavMetaData>> {
         let dk = dir_key(key);
-        if let Ok(h) = self.r2.head(&dk).await {
+        // Probe the explicit marker and list the prefix concurrently; the marker
+        // gives us an mtime, the listing catches marker-less directories.
+        let (head, listing) = tokio::join!(self.r2.head(&dk), self.r2.list_dir(&dk));
+        if let Ok(h) = head {
             let modified = h.last_modified().map(to_system_time);
             return Ok(Box::new(R2MetaData {
                 len: 0,
@@ -50,7 +53,7 @@ impl R2FileSystem {
                 etag: None,
             }));
         }
-        let (files, dirs) = self.r2.list_dir(&dk).await?;
+        let (files, dirs) = listing?;
         if !files.is_empty() || !dirs.is_empty() {
             return Ok(Box::new(R2MetaData::dir()));
         }
@@ -199,7 +202,8 @@ impl DavFileSystem for R2FileSystem {
                 return Err(FsError::Forbidden);
             }
             // Fail if a directory or a file already exists at this path.
-            if self.r2.head(&dk).await.is_ok() || self.r2.head(&key).await.is_ok() {
+            let (dir_exists, file_exists) = tokio::join!(self.r2.head(&dk), self.r2.head(&key));
+            if dir_exists.is_ok() || file_exists.is_ok() {
                 return Err(FsError::Exists);
             }
             self.r2.put(&dk, Bytes::new()).await
