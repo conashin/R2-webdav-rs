@@ -31,6 +31,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # --release uses fat LTO + codegen-units=1 (see [profile.release] in
+      # Cargo.toml), so this also validates the fully optimized artifact.
       - name: Build
         run: cargo build --release --locked
 

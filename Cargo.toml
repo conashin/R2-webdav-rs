@@ -13,7 +13,7 @@ aws-config = "1"
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
@@ -27,5 +27,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
-lto = true
+# "fat" (whole-program) LTO: identical to `lto = true`, spelled out so the
+# optimization level is explicit. Paired with codegen-units = 1 it maximizes
+# cross-crate inlining for the shipped binary at the cost of build time.
+lto = "fat"
 codegen-units = 1
+strip = true
+# NOTE: panic = "abort" is intentionally NOT set. A panic in one connection
+# task must not take down the whole server, and it would skip R2File::drop
+# (which aborts a dangling multipart upload).

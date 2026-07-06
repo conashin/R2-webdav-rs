@@ -5,7 +5,9 @@ use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CommonPrefix, CompletedMultipartUpload, CompletedPart, Object};
+use aws_sdk_s3::types::{
+    CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object, ObjectIdentifier,
+};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use dav_server::fs::FsResult;
@@ -228,6 +230,32 @@ impl R2 {
             .send()
             .await
             .map_err(to_fs_err)?;
+        Ok(())
+    }
+
+    /// Delete many objects in as few requests as possible. R2's `DeleteObjects`
+    /// accepts up to 1000 keys per request, so we chunk accordingly.
+    pub async fn delete_many(&self, keys: &[String]) -> FsResult<()> {
+        for chunk in keys.chunks(1000) {
+            let objects: Vec<ObjectIdentifier> = chunk
+                .iter()
+                .filter_map(|k| ObjectIdentifier::builder().key(k).build().ok())
+                .collect();
+            if objects.is_empty() {
+                continue;
+            }
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .map_err(|_| dav_server::fs::FsError::GeneralFailure)?;
+            self.client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(to_fs_err)?;
+        }
         Ok(())
     }
 

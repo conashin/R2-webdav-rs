@@ -15,6 +15,24 @@ use aws_sdk_s3::error::SdkError;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use dav_server::davpath::DavPath;
 use dav_server::fs::FsError;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+/// Characters escaped when embedding an object key in a public URL path.
+/// `/` is left intact so it keeps separating path segments.
+const PUBLIC_URL_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^');
 
 /// Map an AWS SDK error onto the WebDAV filesystem error type.
 ///
@@ -48,4 +66,10 @@ pub(crate) fn dir_key(key: &str) -> String {
     } else {
         format!("{key}/")
     }
+}
+
+/// Build the public URL for an object key under `base`, percent-encoding the
+/// key while preserving `/` path separators. `base` has no trailing slash.
+pub(crate) fn public_url(base: &str, key: &str) -> String {
+    format!("{base}/{}", utf8_percent_encode(key, PUBLIC_URL_SET))
 }

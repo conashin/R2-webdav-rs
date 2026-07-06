@@ -38,6 +38,9 @@ pub struct R2File {
     etag: Option<String>,
     stream: Option<ByteStream>,
     read_buf: Bytes,
+    /// If set, GET is answered with a 302 redirect to this URL (handler must be
+    /// built with `.redirect(true)`).
+    redirect: Option<String>,
 
     // --- write state ---
     write_buf: BytesMut,
@@ -53,6 +56,7 @@ impl R2File {
         size: u64,
         modified: Option<SystemTime>,
         etag: Option<String>,
+        redirect: Option<String>,
     ) -> Self {
         R2File {
             r2,
@@ -64,6 +68,7 @@ impl R2File {
             etag,
             stream: None,
             read_buf: Bytes::new(),
+            redirect,
             write_buf: BytesMut::new(),
             upload_id: None,
             parts: Vec::new(),
@@ -82,6 +87,7 @@ impl R2File {
             etag: None,
             stream: None,
             read_buf: Bytes::new(),
+            redirect: None,
             write_buf: BytesMut::new(),
             upload_id: None,
             parts: Vec::new(),
@@ -95,11 +101,11 @@ impl R2File {
         if self.upload_id.is_none() {
             self.upload_id = Some(self.r2.create_multipart(&self.key).await?);
         }
-        let upload_id = self.upload_id.clone().unwrap();
+        let upload_id = self.upload_id.as_ref().unwrap();
         let part_number = self.parts.len() as i32 + 1;
         let part = self
             .r2
-            .upload_part(&self.key, &upload_id, part_number, data)
+            .upload_part(&self.key, upload_id, part_number, data)
             .await?;
         self.parts.push(part);
         Ok(())
@@ -210,6 +216,11 @@ impl DavFile for R2File {
             }
             Ok(())
         })
+    }
+
+    fn redirect_url(&mut self) -> FsFuture<'_, Option<String>> {
+        let url = self.redirect.clone();
+        Box::pin(async move { Ok(url) })
     }
 }
 

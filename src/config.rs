@@ -14,6 +14,11 @@ pub struct Config {
     pub username: String,
     pub password: String,
     pub bind_addr: String,
+    /// Public base URL for the bucket (e.g. an r2.dev URL or a custom domain).
+    /// When set, file `GET`s are answered with a `302` redirect to
+    /// `<base>/<key>` instead of streaming through this server. `None` (unset
+    /// or empty) disables the feature.
+    pub public_base_url: Option<String>,
 }
 
 fn required(key: &str) -> Result<String> {
@@ -40,6 +45,10 @@ impl Config {
             username: required("WEBDAV_USERNAME")?,
             password: required("WEBDAV_PASSWORD")?,
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:4918".to_string()),
+            public_base_url: env::var("R2_PUBLIC_BASE_URL")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

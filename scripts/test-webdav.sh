@@ -43,13 +43,14 @@ c=$(code -T "$SRC" "$BASE_URL/test-big.bin")
 [[ "$c" =~ ^2 ]] && pass "upload -> $c" || fail "upload -> $c"
 
 echo "==> 2. GET (download) + checksum"
-curl -sk "${AUTH[@]}" -o "$DST" "$BASE_URL/test-big.bin"
+# -L so the test also works when R2_PUBLIC_BASE_URL redirects GETs to R2.
+curl -skL "${AUTH[@]}" -o "$DST" "$BASE_URL/test-big.bin"
 DST_SUM="$(sha256sum "$DST" | cut -d' ' -f1)"
 [[ "$SRC_SUM" == "$DST_SUM" ]] && pass "checksums match ($SRC_SUM)" \
   || fail "checksum mismatch: $SRC_SUM != $DST_SUM"
 
 echo "==> 3. Range GET (bytes 0-1023)"
-curl -sk "${AUTH[@]}" -r 0-1023 -o "$PART" "$BASE_URL/test-big.bin"
+curl -skL "${AUTH[@]}" -r 0-1023 -o "$PART" "$BASE_URL/test-big.bin"
 n=$(wc -c < "$PART")
 head -c 1024 "$SRC" | cmp -s - "$PART" && [[ "$n" -eq 1024 ]] \
   && pass "got $n bytes, content matches" || fail "range mismatch (got $n bytes)"

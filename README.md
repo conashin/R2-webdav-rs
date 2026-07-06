@@ -37,6 +37,7 @@ cargo build --release
 | `WEBDAV_USERNAME`      | yes      | Username clients must present (Basic auth).                        |
 | `WEBDAV_PASSWORD`      | yes      | Password clients must present (Basic auth).                        |
 | `BIND_ADDR`            | no       | Listen address; default `0.0.0.0:4918`.                            |
+| `R2_PUBLIC_BASE_URL`   | no       | Public base URL for the bucket. When set, file `GET`s are answered with a `302` redirect here (see [GET redirects](#get-redirects)). Empty/unset disables it. |
 | `RUST_LOG`             | no       | Log filter, e.g. `info`, `r2_webdav=debug`.                        |
 
 \* Provide **either** `R2_ENDPOINT` or `R2_ACCOUNT_ID`.
@@ -124,6 +125,29 @@ rclone copy ./big-folder r2dav:/big-folder --progress
 
 - **macOS Finder**: Go → Connect to Server → `http://localhost:4918`
 - **Windows Explorer**: Map network drive → `http://localhost:4918`
+
+## GET redirects
+
+By default every download is streamed through this server. If your bucket is
+reachable at a public URL — an [R2 public bucket](https://developers.cloudflare.com/r2/buckets/public-buckets/)
+`https://pub-<hash>.r2.dev`, or a custom domain — set `R2_PUBLIC_BASE_URL` and
+file `GET`s are answered with a `302` redirect to `<base>/<key>` instead. The
+client fetches the bytes directly from R2 (and, with a custom domain, through
+Cloudflare's CDN), so downloads no longer consume this server's bandwidth or CPU.
+
+```sh
+export R2_PUBLIC_BASE_URL=https://files.example.com
+# or: export R2_PUBLIC_BASE_URL=https://pub-xxxxxxxx.r2.dev
+```
+
+Only `GET` is redirected; `PROPFIND`, `PUT`, `MKCOL`, `DELETE`, etc. are still
+served normally. Leaving the variable empty or unset keeps everything streaming
+through the server.
+
+> [!WARNING]
+> The redirect target is a public URL, so it is **not** protected by this
+> server's Basic auth — anyone with the redirected URL can fetch the object.
+> Only enable this if the bucket's contents may be served publicly.
 
 ## Notes & limitations
 
