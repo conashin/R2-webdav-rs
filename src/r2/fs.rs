@@ -8,12 +8,16 @@ use dav_server::fs::{
     DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream,
     OpenOptions, ReadDirMeta,
 };
+use futures_util::stream::{self, StreamExt};
 
 use super::client::R2;
 use super::file::R2File;
 use super::meta::{to_system_time, R2DirEntry, R2MetaData};
 use super::{dir_key, path_to_key};
 use crate::config::Config;
+
+/// Max in-flight server-side copies when moving/copying a directory tree.
+const COPY_CONCURRENCY: usize = 16;
 
 #[derive(Clone)]
 pub struct R2FileSystem {
@@ -51,6 +55,22 @@ impl R2FileSystem {
             return Ok(Box::new(R2MetaData::dir()));
         }
         Err(FsError::NotFound)
+    }
+
+    /// Server-side copy every `keys` entry from under `fprefix` to `tprefix`,
+    /// with bounded concurrency. Returns the first error encountered.
+    async fn copy_keys(&self, keys: &[String], fprefix: &str, tprefix: &str) -> FsResult<()> {
+        stream::iter(keys.iter())
+            .map(|k| {
+                let rel = k.strip_prefix(fprefix).unwrap_or(k);
+                let newkey = format!("{tprefix}{rel}");
+                async move { self.r2.copy(k, &newkey).await }
+            })
+            .buffer_unordered(COPY_CONCURRENCY)
+            .collect::<Vec<FsResult<()>>>()
+            .await
+            .into_iter()
+            .collect()
     }
 }
 
@@ -199,15 +219,15 @@ impl DavFileSystem for R2FileSystem {
         Box::pin(async move {
             let key = path_to_key(path);
             let dk = dir_key(&key);
-            // Recursively delete everything under the prefix, marker included.
+            // Recursively delete everything under the prefix, marker included,
+            // in batched DeleteObjects requests (up to 1000 keys each).
             let objs = self.r2.list_all(&dk).await?;
-            for o in &objs {
-                if let Some(k) = o.key() {
-                    self.r2.delete(k).await?;
-                }
+            let mut keys: Vec<String> =
+                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            if !keys.iter().any(|k| k == &dk) {
+                keys.push(dk);
             }
-            let _ = self.r2.delete(&dk).await;
-            Ok(())
+            self.r2.delete_many(&keys).await
         })
     }
 
@@ -230,19 +250,10 @@ impl DavFileSystem for R2FileSystem {
             if objs.is_empty() {
                 return Err(FsError::NotFound);
             }
-            for o in &objs {
-                if let Some(k) = o.key() {
-                    let rel = k.strip_prefix(fprefix.as_str()).unwrap_or(k);
-                    let newkey = format!("{tprefix}{rel}");
-                    self.r2.copy(k, &newkey).await?;
-                }
-            }
-            for o in &objs {
-                if let Some(k) = o.key() {
-                    self.r2.delete(k).await?;
-                }
-            }
-            Ok(())
+            let keys: Vec<String> =
+                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            self.copy_keys(&keys, &fprefix, &tprefix).await?;
+            self.r2.delete_many(&keys).await
         })
     }
 
@@ -261,14 +272,9 @@ impl DavFileSystem for R2FileSystem {
             if objs.is_empty() {
                 return Err(FsError::NotFound);
             }
-            for o in &objs {
-                if let Some(k) = o.key() {
-                    let rel = k.strip_prefix(fprefix.as_str()).unwrap_or(k);
-                    let newkey = format!("{tprefix}{rel}");
-                    self.r2.copy(k, &newkey).await?;
-                }
-            }
-            Ok(())
+            let keys: Vec<String> =
+                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            self.copy_keys(&keys, &fprefix, &tprefix).await
         })
     }
 }
