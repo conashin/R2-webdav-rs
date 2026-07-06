@@ -27,7 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
-lto = true
+# "fat" (whole-program) LTO: identical to `lto = true`, spelled out so the
+# optimization level is explicit. Paired with codegen-units = 1 it maximizes
+# cross-crate inlining for the shipped binary at the cost of build time.
+lto = "fat"
 codegen-units = 1
 strip = true
 # NOTE: panic = "abort" is intentionally NOT set. A panic in one connection

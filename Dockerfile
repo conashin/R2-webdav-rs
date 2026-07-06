@@ -18,7 +18,8 @@ RUN mkdir -p src \
     && cargo build --release --locked \
     && rm -rf src
 
-# Now build the real sources.
+# Now build the real sources. The release profile (Cargo.toml) applies fat LTO
+# and codegen-units=1 for the smallest, most optimized shipped binary.
 COPY src ./src
 RUN rm -f target/release/r2-webdav target/release/deps/r2_webdav* \
     && touch src/main.rs \
