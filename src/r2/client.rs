@@ -11,10 +11,14 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use dav_server::fs::FsResult;
+use futures_util::stream::{self, StreamExt};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use super::to_fs_err;
 use crate::config::Config;
+
+/// Max in-flight `DeleteObjects` requests when deleting a large tree.
+const DELETE_CONCURRENCY: usize = 16;
 
 /// Characters that must be escaped in an `x-amz-copy-source` header value.
 /// `/` is deliberately left unescaped so it keeps separating path segments.
@@ -234,8 +238,12 @@ impl R2 {
     }
 
     /// Delete many objects in as few requests as possible. R2's `DeleteObjects`
-    /// accepts up to 1000 keys per request, so we chunk accordingly.
+    /// accepts up to 1000 keys per request, so we chunk accordingly and run the
+    /// chunks with bounded concurrency (mirrors `copy_keys` in `fs.rs`).
     pub async fn delete_many(&self, keys: &[String]) -> FsResult<()> {
+        // Build one request per chunk first, so a builder failure surfaces as an
+        // error rather than being silently dropped.
+        let mut requests: Vec<Delete> = Vec::new();
         for chunk in keys.chunks(1000) {
             let objects: Vec<ObjectIdentifier> = chunk
                 .iter()
@@ -248,15 +256,24 @@ impl R2 {
                 .set_objects(Some(objects))
                 .build()
                 .map_err(|_| dav_server::fs::FsError::GeneralFailure)?;
-            self.client
-                .delete_objects()
-                .bucket(&self.bucket)
-                .delete(delete)
-                .send()
-                .await
-                .map_err(to_fs_err)?;
+            requests.push(delete);
         }
-        Ok(())
+        stream::iter(requests)
+            .map(|delete| async move {
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(to_fs_err)?;
+                Ok(())
+            })
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .collect::<Vec<FsResult<()>>>()
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Server-side copy of a single object.

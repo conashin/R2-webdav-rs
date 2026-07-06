@@ -5,6 +5,7 @@ mod r2;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -16,7 +17,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 
 use config::Config;
@@ -86,7 +87,18 @@ async fn main() -> anyhow::Result<()> {
         let cfg = cfg.clone();
         tokio::spawn(async move {
             let service = service_fn(move |req| handle(req, dav.clone(), cfg.clone()));
-            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+            if let Err(e) = http1::Builder::new()
+                // A timer is required for header_read_timeout to take effect;
+                // configuring the timeout without one would panic.
+                .timer(TokioTimer::new())
+                // Bound the header-read phase so a slow or idle client cannot pin
+                // a connection open indefinitely (Slowloris). This only limits
+                // reading the request head, not streaming request/response bodies,
+                // so large uploads and downloads are unaffected.
+                .header_read_timeout(Duration::from_secs(30))
+                .serve_connection(io, service)
+                .await
+            {
                 tracing::debug!(?peer, error = ?e, "connection error");
             }
         });
