@@ -59,10 +59,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(Config::from_env()?);
     let fs = R2FileSystem::new(&cfg);
-    let dav = DavHandler::builder()
+    let mut builder = DavHandler::builder()
         .filesystem(Box::new(fs))
-        .locksystem(FakeLs::new())
-        .build_handler();
+        .locksystem(FakeLs::new());
+    if let Some(base) = &cfg.public_base_url {
+        // Offload file GETs to R2's public endpoint via 302 redirects.
+        builder = builder.redirect(true);
+        tracing::info!("GET redirect enabled -> {base}");
+    }
+    let dav = builder.build_handler();
 
     let addr: SocketAddr = cfg
         .bind_addr

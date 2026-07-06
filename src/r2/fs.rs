@@ -13,7 +13,7 @@ use futures_util::stream::{self, StreamExt};
 use super::client::R2;
 use super::file::R2File;
 use super::meta::{to_system_time, R2DirEntry, R2MetaData};
-use super::{dir_key, path_to_key};
+use super::{dir_key, path_to_key, public_url};
 use crate::config::Config;
 
 /// Max in-flight server-side copies when moving/copying a directory tree.
@@ -22,6 +22,8 @@ const COPY_CONCURRENCY: usize = 16;
 #[derive(Clone)]
 pub struct R2FileSystem {
     r2: Arc<R2>,
+    /// Public base URL for `GET` redirects; `None` disables redirecting.
+    public_base: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for R2FileSystem {
@@ -34,6 +36,7 @@ impl R2FileSystem {
     pub fn new(cfg: &Config) -> Self {
         R2FileSystem {
             r2: Arc::new(R2::new(cfg)),
+            public_base: cfg.public_base_url.as_deref().map(Arc::from),
         }
     }
 
@@ -63,12 +66,15 @@ impl R2FileSystem {
     /// Server-side copy every `keys` entry from under `fprefix` to `tprefix`,
     /// with bounded concurrency. Returns the first error encountered.
     async fn copy_keys(&self, keys: &[String], fprefix: &str, tprefix: &str) -> FsResult<()> {
-        stream::iter(keys.iter())
+        let pairs: Vec<(String, String)> = keys
+            .iter()
             .map(|k| {
                 let rel = k.strip_prefix(fprefix).unwrap_or(k);
-                let newkey = format!("{tprefix}{rel}");
-                async move { self.r2.copy(k, &newkey).await }
+                (k.clone(), format!("{tprefix}{rel}"))
             })
+            .collect();
+        stream::iter(pairs)
+            .map(|(src, dst)| async move { self.r2.copy(&src, &dst).await })
             .buffer_unordered(COPY_CONCURRENCY)
             .collect::<Vec<FsResult<()>>>()
             .await
@@ -99,10 +105,15 @@ impl DavFileSystem for R2FileSystem {
                 let size = head.content_length().unwrap_or(0).max(0) as u64;
                 let modified = head.last_modified().map(to_system_time);
                 let etag = head.e_tag().map(String::from);
-                Ok(
-                    Box::new(R2File::new_read(self.r2.clone(), key, size, modified, etag))
-                        as Box<dyn DavFile>,
-                )
+                let redirect = self.public_base.as_ref().map(|base| public_url(base, &key));
+                Ok(Box::new(R2File::new_read(
+                    self.r2.clone(),
+                    key,
+                    size,
+                    modified,
+                    etag,
+                    redirect,
+                )) as Box<dyn DavFile>)
             }
         })
     }
@@ -226,8 +237,10 @@ impl DavFileSystem for R2FileSystem {
             // Recursively delete everything under the prefix, marker included,
             // in batched DeleteObjects requests (up to 1000 keys each).
             let objs = self.r2.list_all(&dk).await?;
-            let mut keys: Vec<String> =
-                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            let mut keys: Vec<String> = objs
+                .iter()
+                .filter_map(|o| o.key().map(String::from))
+                .collect();
             if !keys.iter().any(|k| k == &dk) {
                 keys.push(dk);
             }
@@ -254,8 +267,10 @@ impl DavFileSystem for R2FileSystem {
             if objs.is_empty() {
                 return Err(FsError::NotFound);
             }
-            let keys: Vec<String> =
-                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            let keys: Vec<String> = objs
+                .iter()
+                .filter_map(|o| o.key().map(String::from))
+                .collect();
             self.copy_keys(&keys, &fprefix, &tprefix).await?;
             self.r2.delete_many(&keys).await
         })
@@ -276,8 +291,10 @@ impl DavFileSystem for R2FileSystem {
             if objs.is_empty() {
                 return Err(FsError::NotFound);
             }
-            let keys: Vec<String> =
-                objs.iter().filter_map(|o| o.key().map(String::from)).collect();
+            let keys: Vec<String> = objs
+                .iter()
+                .filter_map(|o| o.key().map(String::from))
+                .collect();
             self.copy_keys(&keys, &fprefix, &tprefix).await
         })
     }
