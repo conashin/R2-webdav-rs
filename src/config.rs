@@ -22,7 +22,17 @@ pub struct Config {
 }
 
 fn required(key: &str) -> Result<String> {
-    env::var(key).with_context(|| format!("missing required env var {key}"))
+    let val = env::var(key).with_context(|| format!("missing required env var {key}"))?;
+    // A present-but-empty value is almost always a misconfiguration (e.g. an
+    // unexpanded shell/Compose variable, or an empty `.env` line). For the auth
+    // credentials in particular, an empty value would silently weaken or fully
+    // disable authentication, so fail closed at startup rather than boot with
+    // broken auth. Length-0 only: a password of literal spaces is unusual but
+    // legitimate, so we do not trim before checking.
+    if val.is_empty() {
+        anyhow::bail!("required env var {key} is set but empty");
+    }
+    Ok(val)
 }
 
 impl Config {
@@ -50,5 +60,48 @@ impl Config {
                 .map(|s| s.trim().trim_end_matches('/').to_string())
                 .filter(|s| !s.is_empty()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required;
+    use std::env;
+
+    // Each test uses a unique env var name so the default parallel test runner
+    // cannot race on shared process environment state.
+
+    #[test]
+    fn present_and_non_empty_is_ok() {
+        let key = "R2_WEBDAV_TEST_REQUIRED_OK";
+        env::set_var(key, "value");
+        assert_eq!(required(key).unwrap(), "value");
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn present_but_empty_is_rejected() {
+        // Guards against the fail-open case: an empty credential must not boot.
+        let key = "R2_WEBDAV_TEST_REQUIRED_EMPTY";
+        env::set_var(key, "");
+        assert!(required(key).is_err());
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn missing_is_rejected() {
+        let key = "R2_WEBDAV_TEST_REQUIRED_MISSING";
+        env::remove_var(key);
+        assert!(required(key).is_err());
+    }
+
+    #[test]
+    fn whitespace_only_is_accepted() {
+        // A password of literal spaces is unusual but legitimate; only length-0
+        // is rejected, so this must succeed.
+        let key = "R2_WEBDAV_TEST_REQUIRED_SPACES";
+        env::set_var(key, "   ");
+        assert_eq!(required(key).unwrap(), "   ");
+        env::remove_var(key);
     }
 }
