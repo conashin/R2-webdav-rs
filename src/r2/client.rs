@@ -1,5 +1,7 @@
 //! Thin wrapper around the `aws-sdk-s3` client, configured for Cloudflare R2.
 
+use std::time::Duration;
+
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
@@ -9,12 +11,26 @@ use aws_sdk_s3::types::{
     CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object, ObjectIdentifier,
 };
 use aws_sdk_s3::Client;
+use aws_smithy_types::timeout::TimeoutConfig;
 use bytes::Bytes;
 use dav_server::fs::FsResult;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use super::to_fs_err;
 use crate::config::Config;
+
+/// TCP connect timeout. The SDK default is 3.1s, which is too aggressive for R2
+/// under bursty WebDAV load: many TLS handshakes open at once, some exceed 3.1s,
+/// time out, and each failure triggers 3 retries that open *more* connections —
+/// a congestion collapse. A generous 10s lets healthy connects through.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time-to-first-byte timeout: the limit on reading the first response byte
+/// after a request is initiated (SDK default is unset). Bounds a
+/// wedged-but-connected socket so it fails and retries instead of hanging
+/// forever. It caps only the wait for the first byte, not the total transfer
+/// time, so streaming large-object downloads are unaffected.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Characters that must be escaped in an `x-amz-copy-source` header value.
 /// `/` is deliberately left unescaped so it keeps separating path segments.
@@ -51,6 +67,12 @@ impl R2 {
             // R2 rejects the SDK's default "when supported" checksum headers.
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .read_timeout(READ_TIMEOUT)
+                    .build(),
+            )
             .build();
 
         R2 {

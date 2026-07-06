@@ -1,6 +1,8 @@
 //! `DavFileSystem` implementation mapping WebDAV operations onto R2 objects.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -19,11 +21,33 @@ use crate::config::Config;
 /// Max in-flight server-side copies when moving/copying a directory tree.
 const COPY_CONCURRENCY: usize = 16;
 
+/// How long a cached HEAD result stays fresh. WebDAV clients (and dav-server
+/// itself) issue several `HeadObject`s for the same key within a single logical
+/// operation — e.g. a `GET` heads once for `metadata` and again for `open`. A
+/// short TTL collapses those duplicates while keeping staleness tightly bounded.
+const HEAD_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// Cap on cached HEAD entries; pruning kicks in past this to bound memory.
+const HEAD_CACHE_CAP: usize = 10_000;
+
+/// Distilled, cacheable result of a successful `HeadObject`. Only *positive*
+/// hits are cached: not caching misses avoids the "upload then immediately read
+/// returns 404" hazard, since a pre-upload `NotFound` is never remembered.
+#[derive(Clone)]
+struct HeadMeta {
+    len: u64,
+    modified: Option<SystemTime>,
+    etag: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct R2FileSystem {
     r2: Arc<R2>,
     /// Public base URL for `GET` redirects; `None` disables redirecting.
     public_base: Option<Arc<str>>,
+    /// Short-TTL cache of successful HEADs, keyed by object key. Shared across
+    /// all connection tasks (one per accepted socket).
+    head_cache: Arc<Mutex<HashMap<String, (Instant, HeadMeta)>>>,
 }
 
 impl std::fmt::Debug for R2FileSystem {
@@ -37,7 +61,51 @@ impl R2FileSystem {
         R2FileSystem {
             r2: Arc::new(R2::new(cfg)),
             public_base: cfg.public_base_url.as_deref().map(Arc::from),
+            head_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// HEAD `key`, serving a fresh cached result when one exists. Misses and
+    /// non-`NotFound` errors are never cached. Read-only metadata paths use this;
+    /// mutating paths call `self.r2.head` directly and invalidate afterwards.
+    async fn cached_head(&self, key: &str) -> FsResult<HeadMeta> {
+        if let Some(m) = self.head_cache_get(key) {
+            return Ok(m);
+        }
+        let h = self.r2.head(key).await?;
+        let m = HeadMeta {
+            len: h.content_length().unwrap_or(0).max(0) as u64,
+            modified: h.last_modified().map(to_system_time),
+            etag: h.e_tag().map(String::from),
+        };
+        self.head_cache_put(key, m.clone());
+        Ok(m)
+    }
+
+    fn head_cache_get(&self, key: &str) -> Option<HeadMeta> {
+        let map = self.head_cache.lock().unwrap();
+        let (at, m) = map.get(key)?;
+        (at.elapsed() < HEAD_CACHE_TTL).then(|| m.clone())
+    }
+
+    fn head_cache_put(&self, key: &str, meta: HeadMeta) {
+        let mut map = self.head_cache.lock().unwrap();
+        if map.len() >= HEAD_CACHE_CAP {
+            // Drop stale entries first; if still full, clear wholesale.
+            map.retain(|_, (at, _)| at.elapsed() < HEAD_CACHE_TTL);
+            if map.len() >= HEAD_CACHE_CAP {
+                map.clear();
+            }
+        }
+        map.insert(key.to_string(), (Instant::now(), meta));
+    }
+
+    fn head_cache_invalidate(&self, key: &str) {
+        self.head_cache.lock().unwrap().remove(key);
+    }
+
+    fn head_cache_clear(&self) {
+        self.head_cache.lock().unwrap().clear();
     }
 
     /// Resolve directory metadata for a key, via an explicit `key/` marker or,
@@ -46,12 +114,11 @@ impl R2FileSystem {
         let dk = dir_key(key);
         // Probe the explicit marker and list the prefix concurrently; the marker
         // gives us an mtime, the listing catches marker-less directories.
-        let (head, listing) = tokio::join!(self.r2.head(&dk), self.r2.list_dir(&dk));
+        let (head, listing) = tokio::join!(self.cached_head(&dk), self.r2.list_dir(&dk));
         if let Ok(h) = head {
-            let modified = h.last_modified().map(to_system_time);
             return Ok(Box::new(R2MetaData {
                 len: 0,
-                modified,
+                modified: h.modified,
                 is_dir: true,
                 etag: None,
             }));
@@ -96,22 +163,23 @@ impl DavFileSystem for R2FileSystem {
             }
 
             if options.write {
+                // Existence check must be authoritative, so read through the
+                // cache. Drop any cached entry: this key's object is about to
+                // change once the upload completes.
                 if options.create_new && self.r2.head(&key).await.is_ok() {
                     return Err(FsError::Exists);
                 }
+                self.head_cache_invalidate(&key);
                 Ok(Box::new(R2File::new_write(self.r2.clone(), key)) as Box<dyn DavFile>)
             } else {
-                let head = self.r2.head(&key).await?;
-                let size = head.content_length().unwrap_or(0).max(0) as u64;
-                let modified = head.last_modified().map(to_system_time);
-                let etag = head.e_tag().map(String::from);
+                let head = self.cached_head(&key).await?;
                 let redirect = self.public_base.as_ref().map(|base| public_url(base, &key));
                 Ok(Box::new(R2File::new_read(
                     self.r2.clone(),
                     key,
-                    size,
-                    modified,
-                    etag,
+                    head.len,
+                    head.modified,
+                    head.etag,
                     redirect,
                 )) as Box<dyn DavFile>)
             }
@@ -127,18 +195,13 @@ impl DavFileSystem for R2FileSystem {
             if key.ends_with('/') {
                 return self.dir_metadata(&key).await;
             }
-            match self.r2.head(&key).await {
-                Ok(h) => {
-                    let size = h.content_length().unwrap_or(0).max(0) as u64;
-                    let modified = h.last_modified().map(to_system_time);
-                    let etag = h.e_tag().map(String::from);
-                    Ok(Box::new(R2MetaData {
-                        len: size,
-                        modified,
-                        is_dir: false,
-                        etag,
-                    }) as Box<dyn DavMetaData>)
-                }
+            match self.cached_head(&key).await {
+                Ok(h) => Ok(Box::new(R2MetaData {
+                    len: h.len,
+                    modified: h.modified,
+                    is_dir: false,
+                    etag: h.etag,
+                }) as Box<dyn DavMetaData>),
                 Err(FsError::NotFound) => self.dir_metadata(&key).await,
                 Err(e) => Err(e),
             }
@@ -217,7 +280,9 @@ impl DavFileSystem for R2FileSystem {
             if dir_exists.is_ok() || file_exists.is_ok() {
                 return Err(FsError::Exists);
             }
-            self.r2.put(&dk, Bytes::new()).await
+            self.r2.put(&dk, Bytes::new()).await?;
+            self.head_cache_invalidate(&dk);
+            Ok(())
         })
     }
 
@@ -226,7 +291,9 @@ impl DavFileSystem for R2FileSystem {
             let key = path_to_key(path);
             // HEAD first so a missing object yields 404 rather than a silent 204.
             self.r2.head(&key).await?;
-            self.r2.delete(&key).await
+            self.r2.delete(&key).await?;
+            self.head_cache_invalidate(&key);
+            Ok(())
         })
     }
 
@@ -244,7 +311,10 @@ impl DavFileSystem for R2FileSystem {
             if !keys.iter().any(|k| k == &dk) {
                 keys.push(dk);
             }
-            self.r2.delete_many(&keys).await
+            self.r2.delete_many(&keys).await?;
+            // A whole subtree changed; drop the lot rather than track each key.
+            self.head_cache_clear();
+            Ok(())
         })
     }
 
@@ -257,6 +327,8 @@ impl DavFileSystem for R2FileSystem {
             if self.r2.head(&fk).await.is_ok() {
                 self.r2.copy(&fk, &tk).await?;
                 self.r2.delete(&fk).await?;
+                self.head_cache_invalidate(&fk);
+                self.head_cache_invalidate(&tk);
                 return Ok(());
             }
 
@@ -272,7 +344,10 @@ impl DavFileSystem for R2FileSystem {
                 .filter_map(|o| o.key().map(String::from))
                 .collect();
             self.copy_keys(&keys, &fprefix, &tprefix).await?;
-            self.r2.delete_many(&keys).await
+            self.r2.delete_many(&keys).await?;
+            // Both subtrees changed; drop the lot rather than track each key.
+            self.head_cache_clear();
+            Ok(())
         })
     }
 
@@ -282,7 +357,9 @@ impl DavFileSystem for R2FileSystem {
             let tk = path_to_key(to);
 
             if self.r2.head(&fk).await.is_ok() {
-                return self.r2.copy(&fk, &tk).await;
+                self.r2.copy(&fk, &tk).await?;
+                self.head_cache_invalidate(&tk);
+                return Ok(());
             }
 
             let fprefix = dir_key(&fk);
@@ -295,7 +372,10 @@ impl DavFileSystem for R2FileSystem {
                 .iter()
                 .filter_map(|o| o.key().map(String::from))
                 .collect();
-            self.copy_keys(&keys, &fprefix, &tprefix).await
+            self.copy_keys(&keys, &fprefix, &tprefix).await?;
+            // The destination subtree changed; drop the lot.
+            self.head_cache_clear();
+            Ok(())
         })
     }
 }
