@@ -13,7 +13,7 @@ aws-config = "1"
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
@@ -23,6 +23,7 @@ base64 = "0.22"
 sha2 = "0.10"
 subtle = "2"
 percent-encoding = "2"
+url = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

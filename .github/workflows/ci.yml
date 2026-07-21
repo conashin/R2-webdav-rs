@@ -38,3 +38,25 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  audit:
+    name: cargo audit / deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: cargo deny
+        run: cargo deny check --ignore-rust-version || cargo deny check

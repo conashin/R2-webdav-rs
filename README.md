@@ -36,8 +36,10 @@ cargo build --release
 | `R2_BUCKET`            | yes      | Bucket name.                                                       |
 | `WEBDAV_USERNAME`      | yes      | Username clients must present (Basic auth).                        |
 | `WEBDAV_PASSWORD`      | yes      | Password clients must present (Basic auth).                        |
-| `BIND_ADDR`            | no       | Listen address; default `0.0.0.0:4918`.                            |
-| `R2_PUBLIC_BASE_URL`   | no       | Public base URL for the bucket. When set, file `GET`s are answered with a `302` redirect here (see [GET redirects](#get-redirects)). Empty/unset disables it. |
+| `BIND_ADDR`            | no       | TCP listen address; default `0.0.0.0:4918`. Ignored when `BIND_SOCKET` is set. |
+| `BIND_SOCKET`          | no       | Path to a Unix domain socket. When set, the server listens **only** on this UDS (no TCP exposure). The parent directory must be writable by the process; the socket file is created with mode `0660` so a reverse proxy in a matching group can connect. The stale socket file is removed at startup. |
+| `TRUST_PROXY`          | no       | Set to `1` when running behind a reverse proxy that overwrites `X-Forwarded-For`. The auth rate limiter then keys on the header value; otherwise it keys on the TCP peer IP (or the literal `unix` label when on a UDS). |
+| `R2_PUBLIC_BASE_URL`   | no       | Public base URL for the bucket. When set, file `GET`s are answered with a `302` redirect here (see [GET redirects](#get-redirects)). Must be **HTTPS**, must not be a loopback/private/link-local IP or a cloud metadata endpoint — validated at startup. Empty/unset disables it. |
 | `RUST_LOG`             | no       | Log filter, e.g. `info`, `r2_webdav=debug`.                        |
 
 \* Provide **either** `R2_ENDPOINT` or `R2_ACCOUNT_ID`.
@@ -86,9 +88,91 @@ Build it locally:
 docker build -t r2-webdav .
 ```
 
-## Usage
+## Linux domain socket (Unix socket)
 
-### curl
+For deployments where the server sits on the same host as a reverse proxy
+(Caddy, nginx), listening on a Unix domain socket avoids a TCP port and keeps
+the WebDAV listener off the network namespace entirely.
+
+The Docker image ships a dedicated volume for this purpose: `/run/r2-webdav`.
+The socket file is created with mode `0660`, so a reverse proxy running as a
+user in the `app` group (or with matching uid/gid) can `connect()` to it.
+
+Run the container with the socket exposed:
+
+```sh
+docker run --rm \
+  -e R2_ACCOUNT_ID=xxxxxxxxxxxxxxxx \
+  -e R2_ACCESS_KEY_ID=... \
+  -e R2_SECRET_ACCESS_KEY=... \
+  -e R2_BUCKET=my-bucket \
+  -e WEBDAV_USERNAME=alice \
+  -e WEBDAV_PASSWORD=s3cret \
+  -e BIND_SOCKET=/run/r2-webdav/r2-webdav.sock \
+  -e TRUST_PROXY=1 \
+  -v r2-webdav-run:/run/r2-webdav \
+  ghcr.io/conashin/r2-webdav-rs:latest
+```
+
+To let Caddy (running on the host, in a container, or as a systemd unit)
+connect, mount the same volume into Caddy and point `reverse_proxy` at it:
+
+```caddyfile
+# Caddyfile (Caddy v2)
+files.example.com {
+    reverse_proxy unix//data/r2-webdav/r2-webdav.sock
+    # Optional security headers (defense in depth even when the app
+    # already sets some; Caddy is the TLS termination point so HSTS
+    # belongs here).
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+```
+
+When running both containers in Docker Compose, share the same named volume
+and set the Caddy service's group/`user` so it can read the socket, or mount
+the volume with `mode=0660`:
+
+```yaml
+services:
+  r2-webdav:
+    image: ghcr.io/conashin/r2-webdav-rs:latest
+    environment:
+      R2_ACCOUNT_ID: ...
+      R2_ACCESS_KEY_ID: ...
+      R2_SECRET_ACCESS_KEY: ...
+      R2_BUCKET: my-bucket
+      WEBDAV_USERNAME: alice
+      WEBDAV_PASSWORD: s3cret
+      BIND_SOCKET: /run/r2-webdav/r2-webdav.sock
+      TRUST_PROXY: "1"
+    volumes:
+      - r2-webdav-run:/run/r2-webdav
+
+  caddy:
+    image: caddy:2
+    volumes:
+      - r2-webdav-run:/data/r2-webdav:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "443:443"
+      - "80:80"
+
+volumes:
+  r2-webdav-run:
+```
+
+> [!NOTE]
+> `TRUST_PROXY=1` is required when running behind a reverse proxy so the
+> per-IP auth rate limiter reads the client IP from `X-Forwarded-For` instead
+> of seeing every request as coming from the proxy (or the literal `unix`
+> peer label). Make sure the proxy **overwrites** `X-Forwarded-For` so a
+> client cannot forge it.
+
+## Usage
 
 ```sh
 BASE=http://localhost:4918
@@ -148,6 +232,44 @@ through the server.
 > The redirect target is a public URL, so it is **not** protected by this
 > server's Basic auth — anyone with the redirected URL can fetch the object.
 > Only enable this if the bucket's contents may be served publicly.
+
+## Security hardening
+
+This server is designed to sit behind a TLS-terminating reverse proxy (Caddy,
+nginx, Cloudflare Tunnel) and applies defense-in-depth both at the network
+boundary and inside the process:
+
+- **Path normalization at the trust boundary.** All WebDAV request paths are
+  percent-decoded and validated before being handed to `dav-server`. Empty
+  segments and `.` are dropped; `..` is rejected outright (`403 Forbidden`),
+  and double-encoded traversal (`%2f`, `%2e%2e`) is caught after decode.
+  See `src/safe_path.rs`.
+- **Per-IP authentication rate limiting.** Failed Basic-auth attempts are
+  tracked per client IP (`X-Forwarded-For` when `TRUST_PROXY=1`, else the TCP
+  peer IP). After 10 failures in a 60-second window the IP is locked out for
+  300 seconds. Successful auth resets the counter.
+- **Request body size cap.** `Content-Length` is checked against a 100 MiB
+  ceiling before any auth or path work, so an unauthorized peer cannot force
+  the server to buffer arbitrary data.
+- **Connection concurrency limit.** A `Semaphore` caps simultaneous in-flight
+  connections at 1024; additional `accept()`s block until a permit is freed.
+  Per-connection hyper buffer is also bounded.
+- **SSRF validation.** `R2_PUBLIC_BASE_URL` (used for `GET` redirects) is
+  validated at startup: HTTPS-only, no userinfo, and must not resolve to a
+  loopback/private/link-local address or any well-known cloud metadata
+  endpoint (`169.254.169.254`, `metadata.google.internal`, `metadata.azure.com`).
+- **Object integrity.** `PUT` and multipart `UploadPart` send a SHA-256
+  checksum so R2 can detect in-transit corruption; the SDK's
+  `ResponseChecksumValidation::WhenRequired` is enabled for downloads.
+- **Constant-time credential comparison.** `subtle::ConstantTimeEq` compares
+  SHA-256 digests of both username and password, preventing timing leaks of
+  the credential length or prefix.
+- **Dependency auditing.** CI runs `cargo audit` and `cargo deny` on every
+  push and pull request.
+
+When `BIND_SOCKET` is set (Unix domain socket mode), the server has no TCP
+exposure at all — only the reverse proxy connecting to the socket can reach
+it. Pair with `TRUST_PROXY=1` and a proxy that overwrites `X-Forwarded-For`.
 
 ## Notes & limitations
 

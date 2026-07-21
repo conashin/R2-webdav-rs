@@ -8,13 +8,17 @@ use aws_sdk_s3::config::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object, ObjectIdentifier,
+    ChecksumAlgorithm, CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object,
+    ObjectIdentifier,
 };
 use aws_sdk_s3::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bytes::Bytes;
 use dav_server::fs::FsResult;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use sha2::{Digest, Sha256};
 
 use super::to_fs_err;
 use crate::config::Config;
@@ -161,12 +165,16 @@ impl R2 {
     }
 
     /// Upload a whole object in one request (used for small files).
+    /// Sends a SHA-256 content checksum so R2 can verify integrity on read.
     pub async fn put(&self, key: &str, body: Bytes) -> FsResult<()> {
+        let sha = STANDARD.encode(Sha256::digest(&body));
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(body))
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_sha256(sha)
             .send()
             .await
             .map_err(to_fs_err)?;
@@ -179,6 +187,7 @@ impl R2 {
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .send()
             .await
             .map_err(to_fs_err)?;
@@ -194,6 +203,7 @@ impl R2 {
         part_number: i32,
         body: Bytes,
     ) -> FsResult<CompletedPart> {
+        let sha = STANDARD.encode(Sha256::digest(&body));
         let resp = self
             .client
             .upload_part()
@@ -201,12 +211,15 @@ impl R2 {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_sha256(sha)
             .body(ByteStream::from(body))
             .send()
             .await
             .map_err(to_fs_err)?;
         Ok(CompletedPart::builder()
             .set_e_tag(resp.e_tag().map(String::from))
+            .set_checksum_sha256(resp.checksum_sha256().map(String::from))
             .part_number(part_number)
             .build())
     }
