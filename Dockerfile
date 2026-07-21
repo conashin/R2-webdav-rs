@@ -32,12 +32,24 @@ FROM alpine:3
 # ca-certificates: rustls loads the system trust store to verify R2's TLS cert.
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app \
-    && adduser -S -G app app
+    && adduser -S -G app app \
+    # Socket directory shared between app and the reverse proxy (Caddy).
+    # Mount /run/r2-webdav as a tmpfs or a host volume so the proxy can reach it.
+    && mkdir -p /run/r2-webdav \
+    && chown -R app:app /run/r2-webdav
 
 COPY --from=builder /app/target/release/r2-webdav /usr/local/bin/r2-webdav
 
 USER app
+
+# TCP defaults to 0.0.0.0:4918. To use a Unix domain socket instead, set
+# BIND_SOCKET=/run/r2-webdav/r2-webdav.sock and unset/ignore BIND_ADDR. See
+# README "Linux domain socket" section for volume mounts.
 ENV BIND_ADDR=0.0.0.0:4918
 EXPOSE 4918
+
+# Socket directory; mount this into Caddy (or any reverse proxy) to expose the
+# socket file that the container writes here when BIND_SOCKET is set.
+VOLUME ["/run/r2-webdav"]
 
 ENTRYPOINT ["/usr/local/bin/r2-webdav"]

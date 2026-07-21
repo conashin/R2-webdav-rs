@@ -1,20 +1,40 @@
 //! Thin wrapper around the `aws-sdk-s3` client, configured for Cloudflare R2.
 
+use std::time::Duration;
+
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object, ObjectIdentifier,
+    ChecksumAlgorithm, CommonPrefix, CompletedMultipartUpload, CompletedPart, Delete, Object,
+    ObjectIdentifier,
 };
 use aws_sdk_s3::Client;
+use aws_smithy_types::timeout::TimeoutConfig;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bytes::Bytes;
 use dav_server::fs::FsResult;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use sha2::{Digest, Sha256};
 
 use super::to_fs_err;
 use crate::config::Config;
+
+/// TCP connect timeout. The SDK default is 3.1s, which is too aggressive for R2
+/// under bursty WebDAV load: many TLS handshakes open at once, some exceed 3.1s,
+/// time out, and each failure triggers 3 retries that open *more* connections —
+/// a congestion collapse. A generous 10s lets healthy connects through.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time-to-first-byte timeout: the limit on reading the first response byte
+/// after a request is initiated (SDK default is unset). Bounds a
+/// wedged-but-connected socket so it fails and retries instead of hanging
+/// forever. It caps only the wait for the first byte, not the total transfer
+/// time, so streaming large-object downloads are unaffected.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Characters that must be escaped in an `x-amz-copy-source` header value.
 /// `/` is deliberately left unescaped so it keeps separating path segments.
@@ -51,6 +71,12 @@ impl R2 {
             // R2 rejects the SDK's default "when supported" checksum headers.
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .read_timeout(READ_TIMEOUT)
+                    .build(),
+            )
             .build();
 
         R2 {
@@ -139,12 +165,16 @@ impl R2 {
     }
 
     /// Upload a whole object in one request (used for small files).
+    /// Sends a SHA-256 content checksum so R2 can verify integrity on read.
     pub async fn put(&self, key: &str, body: Bytes) -> FsResult<()> {
+        let sha = STANDARD.encode(Sha256::digest(&body));
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(body))
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_sha256(sha)
             .send()
             .await
             .map_err(to_fs_err)?;
@@ -157,6 +187,7 @@ impl R2 {
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .send()
             .await
             .map_err(to_fs_err)?;
@@ -172,6 +203,7 @@ impl R2 {
         part_number: i32,
         body: Bytes,
     ) -> FsResult<CompletedPart> {
+        let sha = STANDARD.encode(Sha256::digest(&body));
         let resp = self
             .client
             .upload_part()
@@ -179,12 +211,15 @@ impl R2 {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_sha256(sha)
             .body(ByteStream::from(body))
             .send()
             .await
             .map_err(to_fs_err)?;
         Ok(CompletedPart::builder()
             .set_e_tag(resp.e_tag().map(String::from))
+            .set_checksum_sha256(resp.checksum_sha256().map(String::from))
             .part_number(part_number)
             .build())
     }

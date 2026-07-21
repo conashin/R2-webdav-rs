@@ -39,12 +39,19 @@ const PUBLIC_URL_SET: &AsciiSet = &CONTROLS
 /// The concrete per-operation error enums all share the same transport
 /// response type, so we classify by HTTP status where possible.
 pub(crate) fn to_fs_err<E: std::fmt::Debug>(err: SdkError<E, HttpResponse>) -> FsError {
-    match err.raw_response().map(|r| r.status().as_u16()) {
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    match status {
         Some(404) => FsError::NotFound,
         Some(403) => FsError::Forbidden,
         Some(412) => FsError::Exists,
         _ => {
-            tracing::error!(?err, "R2 request failed");
+            // Avoid logging the full SdkError Debug representation, which may
+            // include request/response bodies, signatures, or headers. Log
+            // only the status code and the Display form of the inner error if
+            // available, falling back to the error's type name.
+            let kind = std::any::type_name::<E>();
+            let msg = std::format!("{kind} ");
+            tracing::error!(status = status, error_kind = %msg, "R2 request failed");
             FsError::GeneralFailure
         }
     }

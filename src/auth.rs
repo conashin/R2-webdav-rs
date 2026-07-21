@@ -1,4 +1,8 @@
-//! HTTP Basic authentication.
+//! HTTP Basic authentication with per-IP rate limiting and lockout.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -8,6 +12,134 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::config::Config;
+
+/// Maximum authentication attempts per IP within the window.
+const MAX_ATTEMPTS: u32 = 10;
+/// Sliding window in which `MAX_ATTEMPTS` failures are tolerated.
+const WINDOW: Duration = Duration::from_secs(60);
+/// Lockout duration after exceeding the threshold.
+const LOCKOUT: Duration = Duration::from_secs(300);
+/// Prune interval for the failure map so it does not grow unbounded.
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+enum State {
+    /// `n` failures since `at`, not yet over threshold.
+    Counting { n: u32, at: Instant },
+    /// Locked out until `until`.
+    Locked { until: Instant },
+}
+
+/// Per-IP rate limiter shared across all connection tasks.
+pub struct RateLimiter {
+    map: Mutex<HashMap<String, State>>,
+    last_prune: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        RateLimiter {
+            map: Mutex::new(HashMap::new()),
+            last_prune: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Returns `true` if the IP may attempt authentication, `false` if locked.
+    pub fn check(&self, ip: &str) -> bool {
+        let mut map = self.map.lock().unwrap();
+        let now = Instant::now();
+        self.maybe_prune(&mut map, now);
+        match map.get(ip) {
+            Some(State::Locked { until }) => {
+                if now < *until {
+                    return false;
+                }
+                // Lockout expired: reset and allow.
+                map.remove(ip);
+                true
+            }
+            Some(State::Counting { n, at }) => {
+                // Window expired: reset silently.
+                if now.duration_since(*at) > WINDOW {
+                    map.remove(ip);
+                } else if *n >= MAX_ATTEMPTS {
+                    return false;
+                }
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Record a failed attempt; transitions to locked when threshold is hit.
+    pub fn record_failure(&self, ip: &str) {
+        let mut map = self.map.lock().unwrap();
+        let now = Instant::now();
+        let entry = map
+            .entry(ip.to_string())
+            .or_insert(State::Counting { n: 0, at: now });
+        match entry {
+            State::Counting { n, at } => {
+                if now.duration_since(*at) > WINDOW {
+                    *n = 1;
+                    *at = now;
+                } else {
+                    *n = n.saturating_add(1);
+                }
+                if *n >= MAX_ATTEMPTS {
+                    *entry = State::Locked {
+                        until: now + LOCKOUT,
+                    };
+                }
+            }
+            State::Locked { until } => {
+                if now >= *until {
+                    *entry = State::Counting { n: 1, at: now };
+                }
+            }
+        }
+    }
+
+    /// Clear failures on a successful auth so the window does not accumulate.
+    pub fn record_success(&self, ip: &str) {
+        self.map.lock().unwrap().remove(ip);
+    }
+
+    fn maybe_prune(&self, map: &mut HashMap<String, State>, now: Instant) {
+        let mut last = self.last_prune.lock().unwrap();
+        if now.duration_since(*last) < PRUNE_EVERY {
+            return;
+        }
+        *last = now;
+        map.retain(|_, s| match s {
+            State::Counting { at, .. } => now.duration_since(*at) < WINDOW,
+            State::Locked { until } => now < *until,
+        });
+    }
+}
+
+/// Header name for `X-Forwarded-For`, defined manually because `hyper::header`
+/// does not expose it as a constant.
+pub const X_FORWARDED_FOR: &str = "x-forwarded-for";
+
+/// Extract a client IP from headers, falling back to the literal peer.
+/// `X-Forwarded-For` is trusted only when `trust_proxy` is set (callers MUST
+/// ensure the proxy overwrites this header at the network edge).
+pub fn client_ip(headers: &HeaderMap, peer: &str, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(xff) = headers.get(X_FORWARDED_FOR) {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    let trimmed = first.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+    }
+    peer.to_string()
+}
 
 /// SHA-256 of the input. Comparing digests instead of the raw bytes keeps the
 /// comparison a fixed 32 bytes, so `ConstantTimeEq` never short-circuits and the
@@ -49,7 +181,7 @@ pub fn check(headers: &HeaderMap, cfg: &Config) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, X_FORWARDED_FOR};
     use crate::config::Config;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -65,6 +197,8 @@ mod tests {
             username: "alice".to_string(),
             password: "s3cret".to_string(),
             bind_addr: "0.0.0.0:4918".to_string(),
+            bind_socket: None,
+            trust_proxy: false,
             public_base_url: None,
         }
     }
@@ -118,5 +252,42 @@ mod tests {
         assert!(!check(&bad_b64, &cfg));
         // Valid base64 but no ':' separator.
         assert!(!check(&headers_with_basic("nocolon"), &cfg));
+    }
+
+    #[test]
+    fn rate_limiter_allows_under_threshold() {
+        let rl = super::RateLimiter::new();
+        for _ in 0..super::MAX_ATTEMPTS - 1 {
+            assert!(rl.check("1.2.3.4"));
+            rl.record_failure("1.2.3.4");
+        }
+        assert!(rl.check("1.2.3.4"));
+    }
+
+    #[test]
+    fn rate_limiter_locks_after_threshold() {
+        let rl = super::RateLimiter::new();
+        for _ in 0..super::MAX_ATTEMPTS {
+            rl.record_failure("1.2.3.4");
+        }
+        // The next check should be locked.
+        assert!(!rl.check("1.2.3.4"));
+    }
+
+    #[test]
+    fn rate_limiter_success_resets() {
+        let rl = super::RateLimiter::new();
+        rl.record_failure("1.2.3.4");
+        rl.record_success("1.2.3.4");
+        // After success the window was cleared.
+        assert!(rl.check("1.2.3.4"));
+    }
+
+    #[test]
+    fn client_ip_uses_xff_only_when_trusted() {
+        let mut h = HeaderMap::new();
+        h.insert(X_FORWARDED_FOR, "9.9.9.9, 8.8.8.8".parse().unwrap());
+        assert_eq!(super::client_ip(&h, "1.1.1.1", true), "9.9.9.9");
+        assert_eq!(super::client_ip(&h, "1.1.1.1", false), "1.1.1.1");
     }
 }
