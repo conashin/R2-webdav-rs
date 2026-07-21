@@ -8,8 +8,8 @@ repository = "https://github.com/conashin/R2-webdav-rs"
 
 [dependencies]
 dav-server = "0.11"
-aws-sdk-s3 = "1"
-aws-config = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
